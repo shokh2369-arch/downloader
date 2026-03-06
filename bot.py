@@ -846,6 +846,15 @@ def reencode_video_ios_compatible(src: Path) -> Path | None:
 _YTDLP_GO_FORMAT = "bv*[vcodec^=avc1][height<=1080]+ba[acodec^=mp4a]/b[ext=mp4]/b"
 _YTDLP_GO_PP = "ffmpeg:-movflags +faststart -pix_fmt yuv420p"
 
+# Browser-like User-Agent for YouTube (can reduce "Sign in to confirm you're not a bot" on some IPs)
+_YTDLP_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+
+def _inject_ytdlp_user_agent(args: list[str]) -> None:
+    """Insert --user-agent after the program name so YouTube sees a real browser."""
+    args.insert(1, _YTDLP_UA)
+    args.insert(1, "--user-agent")
+
 
 def build_ytdlp_args(out_tpl: str, link: str, strict_video: bool) -> list[str]:
     # More fragments + fast fail = faster HLS/DASH; retries 2, socket 25s
@@ -919,18 +928,33 @@ def download_other(link: str, task_dir: Path) -> tuple[list[Path], str] | None:
     out_tpl = str(task_dir / "%(title).80s.%(id)s.%(ext)s")
 
     if is_youtube(link):
-        # Try without cookies first — most public videos work and we avoid "Sign in to confirm you're not a bot"
+        cookie_file = BASE_DIR / "youtube.txt"
+        # 1) No cookies, strict format, browser User-Agent
         args = build_ytdlp_args(out_tpl, link, strict_video=True)
+        _inject_ytdlp_user_agent(args)
         run_cmd(args)
         files = recent_files(since_ts, task_dir)
         if files:
             return files, detect_type(files)
-        # Then try with cookies (headless cookies often get bot-blocked; user-exported cookies help)
-        cookie_file = BASE_DIR / "youtube.txt"
+        # 2) No cookies, best format only (avoids "format not available" on some videos)
+        args_best = [
+            "yt-dlp", "--no-warnings", "--yes-playlist", "--max-filesize", f"{MAX_VIDEO_MB}M",
+            "--concurrent-fragments", "12", "--retries", "2", "--socket-timeout", "25",
+            "-f", "b", "--merge-output-format", "mp4",
+            "--postprocessor-args", f"ffmpeg:{_FFMPEG_SCALE_FIT}",
+            "-o", out_tpl, link,
+        ]
+        _inject_ytdlp_user_agent(args_best)
+        run_cmd(args_best)
+        files = recent_files(since_ts, task_dir)
+        if files:
+            return files, detect_type(files)
+        # 3) With cookies (user-exported or headless)
         if not cookie_file.is_file():
             get_youtube_cookies_headless(cookie_file)
         if cookie_file.is_file():
             args_c = build_ytdlp_args(out_tpl, link, strict_video=True)
+            _inject_ytdlp_user_agent(args_c)
             args_c.insert(1, str(cookie_file))
             args_c.insert(1, "--cookies")
             run_cmd(args_c)
@@ -939,6 +963,19 @@ def download_other(link: str, task_dir: Path) -> tuple[list[Path], str] | None:
                 return files, detect_type(files)
             get_youtube_cookies_headless(cookie_file)
             run_cmd(args_c)
+            files = recent_files(since_ts, task_dir)
+            if files:
+                return files, detect_type(files)
+            # 4) Cookies + best format
+            args_cb = [
+                "yt-dlp", "--no-warnings", "--yes-playlist", "--max-filesize", f"{MAX_VIDEO_MB}M",
+                "--concurrent-fragments", "12", "--retries", "2", "--socket-timeout", "25",
+                "--cookies", str(cookie_file), "-f", "b", "--merge-output-format", "mp4",
+                "--postprocessor-args", f"ffmpeg:{_FFMPEG_SCALE_FIT}",
+                "-o", out_tpl, link,
+            ]
+            _inject_ytdlp_user_agent(args_cb)
+            run_cmd(args_cb)
             files = recent_files(since_ts, task_dir)
             if files:
                 return files, detect_type(files)
