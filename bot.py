@@ -30,6 +30,7 @@ _DOWNLOAD_WORKERS = 6
 from dotenv import load_dotenv
 from telegram import Message, Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.error import Conflict, TimedOut
 
 import instaloader
 from instaloader import Post
@@ -927,13 +928,19 @@ def download_other(link: str, task_dir: Path) -> tuple[list[Path], str] | None:
         files = recent_files(since_ts, task_dir)
         if files:
             return files, detect_type(files)
-        if not cookie_file.is_file():
-            return None
-        get_youtube_cookies_headless(cookie_file)
-        args_yt = build_ytdlp_args(out_tpl, link, strict_video=True)
-        args_yt.insert(1, str(cookie_file))
-        args_yt.insert(1, "--cookies")
-        run_cmd(args_yt)
+        # Retry with refreshed cookies if we have a cookie file
+        if cookie_file.is_file():
+            get_youtube_cookies_headless(cookie_file)
+            args_yt = build_ytdlp_args(out_tpl, link, strict_video=True)
+            args_yt.insert(1, str(cookie_file))
+            args_yt.insert(1, "--cookies")
+            run_cmd(args_yt)
+            files = recent_files(since_ts, task_dir)
+            if files:
+                return files, detect_type(files)
+        # Final fallback: try without cookies (many public videos work)
+        args_no_cookie = build_ytdlp_args(out_tpl, link, strict_video=True)
+        run_cmd(args_no_cookie)
         files = recent_files(since_ts, task_dir)
         if files:
             return files, detect_type(files)
@@ -1252,12 +1259,23 @@ def _run_health_server(port: int) -> None:
     """Run a minimal HTTP server for GET /health (e.g. Docker HEALTHCHECK)."""
 
     class Handler(BaseHTTPRequestHandler):
+        def _health_ok(self) -> bool:
+            return self.path in ("/health", "/health/")
+
         def do_GET(self) -> None:
-            if self.path == "/health" or self.path == "/health/":
+            if self._health_ok():
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain")
                 self.end_headers()
                 self.wfile.write(b"ok")
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def do_HEAD(self) -> None:
+            if self._health_ok():
+                self.send_response(200)
+                self.end_headers()
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -1295,7 +1313,11 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cookies", cmd_cookies))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.add_error_handler(_error_handler)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 
 async def _log_startup(app: Application) -> None:
@@ -1305,6 +1327,23 @@ async def _log_startup(app: Application) -> None:
         CONFIG.download_timeout,
         CONFIG.max_video_mb,
     )
+
+
+async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log errors; for Conflict (multiple instances) log a clear message."""
+    err = context.error
+    if err is None:
+        return
+    if isinstance(err, Conflict):
+        logger.warning(
+            "Telegram Conflict: another bot instance is running (e.g. old deploy). "
+            "Ensure only one instance uses this token, or wait for the other to stop."
+        )
+        return
+    if isinstance(err, TimedOut):
+        logger.warning("Telegram request timed out: %s", err)
+        return
+    logger.exception("Update %s caused error: %s", update, err)
 
 
 if __name__ == "__main__":
