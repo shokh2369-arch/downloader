@@ -886,7 +886,11 @@ def apply_cookies(args: list[str], link: str) -> None:
         for i, x in enumerate(items):
             args.insert(1 + i, x)
     if is_youtube(link):
-        add("--cookies-from-browser", "firefox")
+        cookie_file = BASE_DIR / "youtube.txt"
+        if cookie_file.is_file():
+            add("--cookies", str(cookie_file))
+        else:
+            add("--cookies-from-browser", "firefox")
         return
     link_lower = link.lower()
     if "instagram" in link_lower and (BASE_DIR / "instagram.txt").is_file():
@@ -914,22 +918,25 @@ def download_other(link: str, task_dir: Path) -> tuple[list[Path], str] | None:
     out_tpl = str(task_dir / "%(title).80s.%(id)s.%(ext)s")
 
     if is_youtube(link):
+        cookie_file = BASE_DIR / "youtube.txt"
+        if not cookie_file.is_file():
+            get_youtube_cookies_headless(cookie_file)
         args = build_ytdlp_args(out_tpl, link, strict_video=True)
+        apply_cookies(args, link)
         run_cmd(args)
         files = recent_files(since_ts, task_dir)
         if files:
             return files, detect_type(files)
-        cookie_file = BASE_DIR / "youtube.txt"
         if not cookie_file.is_file():
-            get_youtube_cookies_headless(cookie_file)
-        if cookie_file.is_file():
-            args_yt = build_ytdlp_args(out_tpl, link, strict_video=True)
-            args_yt.insert(1, str(cookie_file))
-            args_yt.insert(1, "--cookies")
-            run_cmd(args_yt)
-            files = recent_files(since_ts, task_dir)
-            if files:
-                return files, detect_type(files)
+            return None
+        get_youtube_cookies_headless(cookie_file)
+        args_yt = build_ytdlp_args(out_tpl, link, strict_video=True)
+        args_yt.insert(1, str(cookie_file))
+        args_yt.insert(1, "--cookies")
+        run_cmd(args_yt)
+        files = recent_files(since_ts, task_dir)
+        if files:
+            return files, detect_type(files)
         return None
 
     # Facebook: auto-detect video vs photo — video → yt-dlp, photo/post → scraper + fallbacks
