@@ -102,6 +102,29 @@ MIN_VIDEO_BYTES = 50 * 1024  # 50 KB
 # Max images to include in a carousel (video + photos) so we don't send 100 items
 MAX_CAROUSEL_IMAGES = 20
 
+# Cookie files we write; invalid ones are auto-deleted at startup so deployment can re-fetch
+COOKIE_FILES = ("youtube.txt", "facebook.txt", "twitter.txt", "pinterest.txt", "instagram.txt")
+
+
+def _cookie_file_has_invalid_expiry(path: Path) -> bool:
+    """True if file contains Netscape cookie lines with expires=-1 (yt-dlp skips those)."""
+    if not path.is_file():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        return "\t-1\t" in text
+    except OSError:
+        return False
+
+
+def cleanup_invalid_cookie_files() -> None:
+    """Delete cookie .txt files that contain invalid expiry (-1) so they are re-created on first use (e.g. after deployment)."""
+    for name in COOKIE_FILES:
+        path = BASE_DIR / name
+        if _cookie_file_has_invalid_expiry(path):
+            _safe_unlink(path)
+            logger.info("Removed invalid cookie file %s (will be re-created when needed)", name)
+
 
 def _safe_rmtree(path: Path) -> None:
     """Remove directory tree; never raise."""
@@ -203,6 +226,10 @@ def instagram_shortcode(link: str) -> str | None:
 # ---------------------------------------------------------------------------
 # YouTube: get cookies in headless (pseudo) mode, then use with yt-dlp
 # ---------------------------------------------------------------------------
+# Session cookies use expires=-1; yt-dlp skips those. Use far-future expiry so they are accepted.
+_SESSION_COOKIE_EXPIRY = 2147483647  # max 32-bit signed, ~year 2038
+
+
 def _cookies_to_netscape(cookies: list[dict]) -> str:
     """Convert browser-style cookie list to Netscape format. Domain must have leading dot when include_subdomains is TRUE (Python cookiejar requirement)."""
     lines = ["# Netscape HTTP Cookie File", "# https://www.youtube.com"]
@@ -212,7 +239,13 @@ def _cookies_to_netscape(cookies: list[dict]) -> str:
         path = c.get("path", "/")
         secure = "TRUE" if c.get("secure") else "FALSE"
         exp = c.get("expires")
-        expiry = int(exp) if exp is not None and exp != -1 else -1
+        if exp is None or exp == -1:
+            expiry = _SESSION_COOKIE_EXPIRY
+        else:
+            try:
+                expiry = int(exp)
+            except (TypeError, ValueError):
+                expiry = _SESSION_COOKIE_EXPIRY
         name = c.get("name", "")
         value = c.get("value", "")
         if not domain or not name:
@@ -264,9 +297,9 @@ def _playwright_cookies_to_netscape(cookies: list[dict], comment: str = "Faceboo
         secure = "TRUE" if c.get("secure") else "FALSE"
         exp = c.get("expires") if c.get("expires") is not None else -1
         try:
-            expiry = int(exp) if exp != -1 else -1
+            expiry = int(exp) if (exp is not None and exp != -1) else _SESSION_COOKIE_EXPIRY
         except (TypeError, ValueError):
-            expiry = -1
+            expiry = _SESSION_COOKIE_EXPIRY
         name = c.get("name") or ""
         value = c.get("value") or ""
         if not domain or not name:
@@ -1238,6 +1271,8 @@ def main() -> None:
     if not token:
         logger.error("BOT_TOKEN not set (use .env or export)")
         raise SystemExit(1)
+
+    cleanup_invalid_cookie_files()
 
     health_port = int(os.getenv("HEALTH_PORT", "8080"))
     health_thread = threading.Thread(target=_run_health_server, args=(health_port,), daemon=True)
