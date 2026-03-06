@@ -1,10 +1,11 @@
-# Telegram media downloader bot: YouTube, Instagram, Facebook, TikTok, X, Pinterest
+# Telegram media downloader bot: YouTube (youtube-dl), Instagram, Facebook, TikTok, X, Pinterest (yt-dlp)
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
-    HEALTH_PORT=8080
+    HEALTH_PORT=8080 \
+    PIP_ROOT_USER_ACTION=ignore
 
-# ffmpeg (video re-encode), yt-dlp (CLI), curl (healthcheck), deps for Playwright Chromium
+# ffmpeg (video re-encode), curl (healthcheck), deps for Playwright Chromium
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
@@ -30,10 +31,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# yt-dlp (invoked by bot as subprocess)
-RUN pip install --no-cache-dir yt-dlp
-
-# Playwright Chromium for Facebook/Twitter/Pinterest/cookies
+# Playwright Chromium (Facebook/Twitter/Pinterest/cookies, headless)
 RUN playwright install chromium
 
 COPY bot.py .
