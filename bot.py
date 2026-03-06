@@ -919,31 +919,29 @@ def download_other(link: str, task_dir: Path) -> tuple[list[Path], str] | None:
     out_tpl = str(task_dir / "%(title).80s.%(id)s.%(ext)s")
 
     if is_youtube(link):
-        cookie_file = BASE_DIR / "youtube.txt"
-        if not cookie_file.is_file():
-            get_youtube_cookies_headless(cookie_file)
+        # Try without cookies first — most public videos work and we avoid "Sign in to confirm you're not a bot"
         args = build_ytdlp_args(out_tpl, link, strict_video=True)
-        apply_cookies(args, link)
         run_cmd(args)
         files = recent_files(since_ts, task_dir)
         if files:
             return files, detect_type(files)
-        # Retry with refreshed cookies if we have a cookie file
-        if cookie_file.is_file():
+        # Then try with cookies (headless cookies often get bot-blocked; user-exported cookies help)
+        cookie_file = BASE_DIR / "youtube.txt"
+        if not cookie_file.is_file():
             get_youtube_cookies_headless(cookie_file)
-            args_yt = build_ytdlp_args(out_tpl, link, strict_video=True)
-            args_yt.insert(1, str(cookie_file))
-            args_yt.insert(1, "--cookies")
-            run_cmd(args_yt)
+        if cookie_file.is_file():
+            args_c = build_ytdlp_args(out_tpl, link, strict_video=True)
+            args_c.insert(1, str(cookie_file))
+            args_c.insert(1, "--cookies")
+            run_cmd(args_c)
             files = recent_files(since_ts, task_dir)
             if files:
                 return files, detect_type(files)
-        # Final fallback: try without cookies (many public videos work)
-        args_no_cookie = build_ytdlp_args(out_tpl, link, strict_video=True)
-        run_cmd(args_no_cookie)
-        files = recent_files(since_ts, task_dir)
-        if files:
-            return files, detect_type(files)
+            get_youtube_cookies_headless(cookie_file)
+            run_cmd(args_c)
+            files = recent_files(since_ts, task_dir)
+            if files:
+                return files, detect_type(files)
         return None
 
     # Facebook: auto-detect video vs photo — video → yt-dlp, photo/post → scraper + fallbacks
