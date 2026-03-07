@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import http.cookiejar
 import logging
 import os
 import re
@@ -373,6 +374,52 @@ def get_facebook_cookies_headless(cookie_path: Path, timeout_sec: int = 25) -> b
     except Exception as e:
         logger.warning("Headless Facebook cookies: %s", e)
         return False
+
+
+def _get_site_cookies_headless(
+    url: str, cookie_path: Path, timeout_sec: int = 20, wait_ms: int = 1200, comment: str = "Cookies"
+) -> bool:
+    """Generic: open URL in headless browser, save cookies to cookie_path (Netscape). Returns True if written."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return False
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 720},
+            )
+            page = context.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_sec * 1000)
+            page.wait_for_timeout(wait_ms)
+            cookies = context.cookies()
+            browser.close()
+        if not cookies:
+            return False
+        netscape = _playwright_cookies_to_netscape(cookies, comment=comment)
+        cookie_path.write_text(netscape, encoding="utf-8")
+        logger.info("Cookies saved from headless browser to %s", cookie_path.name)
+        return True
+    except Exception as e:
+        logger.warning("Headless cookies %s: %s", cookie_path.name, e)
+        return False
+
+
+def get_twitter_cookies_headless(cookie_path: Path, timeout_sec: int = 20) -> bool:
+    """Auto-get Twitter/X cookies via headless browser. Saves to cookie_path (Netscape)."""
+    return _get_site_cookies_headless("https://twitter.com", cookie_path, timeout_sec=timeout_sec, wait_ms=1500, comment="Twitter")
+
+
+def get_pinterest_cookies_headless(cookie_path: Path, timeout_sec: int = 20) -> bool:
+    """Auto-get Pinterest cookies via headless browser. Saves to cookie_path (Netscape)."""
+    return _get_site_cookies_headless("https://www.pinterest.com", cookie_path, timeout_sec=timeout_sec, wait_ms=1500, comment="Pinterest")
+
+
+def get_instagram_cookies_headless(cookie_path: Path, timeout_sec: int = 22) -> bool:
+    """Auto-get Instagram cookies via headless browser. Saves to cookie_path (Netscape)."""
+    return _get_site_cookies_headless("https://www.instagram.com", cookie_path, timeout_sec=timeout_sec, wait_ms=1800, comment="Instagram")
 
 
 def resolve_facebook_share_url(url: str, timeout_sec: int = 14) -> str | None:
@@ -818,7 +865,15 @@ def download_instagram_instaloader(shortcode: str, download_dir: Path) -> list[P
             user_agent=INSTAGRAM_UA,  # Chrome UA + Referer below improve CDN speed (see instaloader #1233)
             request_timeout=35.0,
         )
-        # Referer speeds up media downloads (avoids ~50KB/s throttling when missing).
+        # Load cookies from instagram.txt (Netscape) if present (auto-fetched when missing)
+        instagram_cookie = BASE_DIR / "instagram.txt"
+        if instagram_cookie.is_file():
+            try:
+                jar = http.cookiejar.MozillaCookieJar(str(instagram_cookie))
+                jar.load(ignore_discard=True, ignore_expires=True)
+                loader.context._session.cookies = jar
+            except Exception:
+                pass
         try:
             loader.context._session.headers["Referer"] = "https://www.instagram.com/"
         except Exception:
@@ -836,7 +891,90 @@ def download_instagram_instaloader(shortcode: str, download_dir: Path) -> list[P
 
 
 # ---------------------------------------------------------------------------
-# Video re-encode (ffmpeg only; no yt-dlp)
+# YouTube: yt-dlp fallback when pytube fails
+# ---------------------------------------------------------------------------
+_UA_CHROME = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+
+def download_youtube_ytdlp(link: str, task_dir: Path, with_cookies: bool = True) -> tuple[list[Path], str] | None:
+    """Download YouTube with yt-dlp. Uses youtube.txt if with_cookies and file exists. Returns (files, 'video') or None."""
+    task_dir.mkdir(parents=True, exist_ok=True)
+    since_ts = time.time()
+    out_tpl = str(task_dir / "%(title).80s.%(id)s.%(ext)s")
+    args = [
+        "yt-dlp", "--no-warnings", "--max-filesize", f"{MAX_VIDEO_MB}M",
+        "--user-agent", _UA_CHROME,
+        "-f", "bv*[height<=1080]+ba/b", "--merge-output-format", "mp4",
+        "-o", out_tpl, link,
+    ]
+    if with_cookies:
+        cookie_file = BASE_DIR / "youtube.txt"
+        if cookie_file.is_file():
+            args.insert(1, str(cookie_file))
+            args.insert(1, "--cookies")
+    run_cmd(args, timeout=DOWNLOAD_TIMEOUT)
+    files = recent_files(since_ts, task_dir)
+    files = [p for p in files if p.suffix.lower() in (".mp4", ".mov", ".webm", ".mkv") and p.stat().st_size >= MIN_VIDEO_BYTES]
+    if files:
+        return (files, "video")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Facebook video: yt-dlp (only for Facebook video URLs)
+# ---------------------------------------------------------------------------
+def download_facebook_video_ytdlp(url: str, task_dir: Path) -> tuple[list[Path], str] | None:
+    """Download Facebook video with yt-dlp. Returns (files, 'video') or None."""
+    task_dir.mkdir(parents=True, exist_ok=True)
+    since_ts = time.time()
+    out_tpl = str(task_dir / "%(title).80s.%(id)s.%(ext)s")
+    args = [
+        "yt-dlp", "--no-warnings", "--max-filesize", f"{MAX_VIDEO_MB}M",
+        "-f", "bv*[height<=1080]+ba/b", "--merge-output-format", "mp4",
+        "-o", out_tpl, url,
+    ]
+    cookie_file = BASE_DIR / "facebook.txt"
+    if cookie_file.is_file():
+        args.insert(1, str(cookie_file))
+        args.insert(1, "--cookies")
+    run_cmd(args, timeout=DOWNLOAD_TIMEOUT)
+    files = recent_files(since_ts, task_dir)
+    files = [p for p in files if p.suffix.lower() in (".mp4", ".mov") and p.stat().st_size >= MIN_VIDEO_BYTES]
+    if files:
+        return (files, "video")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# TikTok: yt-dlp (with SSL workaround and retry)
+# ---------------------------------------------------------------------------
+def download_tiktok_ytdlp(link: str, task_dir: Path) -> tuple[list[Path], str] | None:
+    """Download TikTok video with yt-dlp. Uses --no-check-certificates for SSL issues. Returns (files, 'video') or None."""
+    task_dir.mkdir(parents=True, exist_ok=True)
+    since_ts = time.time()
+    out_tpl = str(task_dir / "%(title).80s.%(id)s.%(ext)s")
+    args = [
+        "yt-dlp", "--no-warnings", "--max-filesize", f"{MAX_VIDEO_MB}M",
+        "--no-check-certificates",
+        "-f", "bv*[height<=1080]+ba/b", "--merge-output-format", "mp4",
+        "-o", out_tpl, link,
+    ]
+    run_cmd(args, timeout=DOWNLOAD_TIMEOUT)
+    files = recent_files(since_ts, task_dir)
+    files = [p for p in files if p.suffix.lower() in (".mp4", ".mov", ".webm", ".mkv") and p.stat().st_size >= MIN_VIDEO_BYTES]
+    if files:
+        return (files, "video")
+    time.sleep(2)
+    run_cmd(args, timeout=DOWNLOAD_TIMEOUT)
+    files = recent_files(since_ts, task_dir)
+    files = [p for p in files if p.suffix.lower() in (".mp4", ".mov", ".webm", ".mkv") and p.stat().st_size >= MIN_VIDEO_BYTES]
+    if files:
+        return (files, "video")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Video re-encode (ffmpeg)
 # ---------------------------------------------------------------------------
 # Scale + format for all devices; H.264 baseline + AAC + faststart for iPhone/iOS (baseline = max compatibility)
 _FFMPEG_SCALE_FIT = (
@@ -876,18 +1014,33 @@ def reencode_video_ios_compatible(src: Path) -> Path | None:
 
 def download_other(link: str, task_dir: Path) -> tuple[list[Path], str] | None:
     """
-    Download from link into task_dir. No yt-dlp. YouTube: pytube only. Facebook/Twitter/Pinterest: scraper + Playwright.
+    Download from link into task_dir. YouTube: pytube + yt-dlp fallback. Facebook video: yt-dlp; photo/post: scraper + Playwright. TikTok: yt-dlp. Twitter/Pinterest: Playwright.
     """
     task_dir.mkdir(parents=True, exist_ok=True)
 
     if is_youtube(link):
-        # YouTube: pytube only (720p progressive MP4)
+        # 1) Pytube first (720p progressive, no cookies)
         pytube_files = download_youtube_pytube(link, task_dir)
         if pytube_files:
             return pytube_files, detect_type(pytube_files)
+        # 2) yt-dlp fallback (with cookies if available)
+        cookie_file = BASE_DIR / "youtube.txt"
+        if not cookie_file.is_file():
+            get_youtube_cookies_headless(cookie_file)
+        result = download_youtube_ytdlp(link, task_dir, with_cookies=True)
+        if result:
+            return result
+        get_youtube_cookies_headless(cookie_file)
+        result = download_youtube_ytdlp(link, task_dir, with_cookies=True)
+        if result:
+            return result
+        # 3) yt-dlp without cookies (some public videos work)
+        result = download_youtube_ytdlp(link, task_dir, with_cookies=False)
+        if result:
+            return result
         return None
 
-    # Facebook: run scraper and Playwright in parallel; use first successful result (faster)
+    # Facebook: video URL → yt-dlp; else scraper + Playwright in parallel
     is_facebook = "facebook.com" in link.lower() or "fb.watch" in link.lower() or "fb.com" in link.lower()
     if is_facebook:
         facebook_cookie_path = BASE_DIR / "facebook.txt"
@@ -898,6 +1051,10 @@ def download_other(link: str, task_dir: Path) -> tuple[list[Path], str] | None:
             resolved = resolve_facebook_share_url(link)
             if resolved:
                 effective = resolved
+        if is_facebook_video_url(effective):
+            result = download_facebook_video_ytdlp(effective, task_dir)
+            if result:
+                return result
         def only_photos_if_carousel(files: list[Path], typ: str) -> tuple[list[Path], str]:
             img_exts = (".jpg", ".jpeg", ".png", ".webp", ".gif")
             has_vid = any(p.suffix.lower() in (".mp4", ".mov") for p in files)
@@ -933,21 +1090,33 @@ def download_other(link: str, task_dir: Path) -> tuple[list[Path], str] | None:
                         return only_photos_if_carousel(*result)
         return None
 
-    # Twitter/X: Playwright for images only
+    # Twitter/X: Playwright for images only (auto-get cookies if missing)
     if "twitter.com" in link.lower() or "x.com" in link.lower():
+        twitter_cookie = BASE_DIR / "twitter.txt"
+        if not twitter_cookie.is_file():
+            get_twitter_cookies_headless(twitter_cookie)
         result = download_twitter_media_playwright(link, task_dir)
         if result:
             return result
         return None
 
-    # Pinterest: Playwright for images only
+    # Pinterest: Playwright for images only (auto-get cookies if missing)
     if "pinterest.com" in link.lower() or "pin.it" in link.lower():
+        pinterest_cookie = BASE_DIR / "pinterest.txt"
+        if not pinterest_cookie.is_file():
+            get_pinterest_cookies_headless(pinterest_cookie)
         result = download_pinterest_media_playwright(link, task_dir)
         if result:
             return result
         return None
 
-    # TikTok and other domains: not supported without yt-dlp
+    # TikTok: yt-dlp
+    if "tiktok.com" in link.lower() or "vm.tiktok" in link.lower():
+        result = download_tiktok_ytdlp(link, task_dir)
+        if result:
+            return result
+        return None
+
     return None
 
 
@@ -1045,6 +1214,10 @@ async def _process_links_task(
         for link in links:
             shortcode = instagram_shortcode(link)
             if shortcode:
+                # Auto-get Instagram cookies if missing
+                instagram_cookie = BASE_DIR / "instagram.txt"
+                if not instagram_cookie.is_file():
+                    await asyncio.to_thread(get_instagram_cookies_headless, instagram_cookie)
                 ig_dir = DOWNLOADS_DIR / "ig" / f"task_{update.update_id}_{id(link)}"
                 ig_dir.mkdir(parents=True, exist_ok=True)
                 try:
