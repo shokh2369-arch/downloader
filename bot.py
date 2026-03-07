@@ -898,12 +898,22 @@ def download_instagram_instaloader(shortcode: str, download_dir: Path) -> list[P
 _UA_CHROME = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 
-def download_youtube_ytdlp(link: str, task_dir: Path, with_cookies: bool = True, format_best: bool = False) -> tuple[list[Path], str] | None:
-    """Download YouTube with yt-dlp. Uses youtube.txt if with_cookies and file exists. format_best=True uses -f b. Returns (files, 'video') or None."""
+def _is_youtube_auth_error(err_text: str) -> bool:
+    """True if yt-dlp output suggests cookie/login/auth problem (so we can auto-refresh cookies)."""
+    if not err_text:
+        return False
+    low = err_text.lower()
+    return (
+        "sign in" in low or "login" in low or "cookie" in low or "bot" in low
+        or "confirm you're not a bot" in low or "authentication" in low
+    )
+
+
+def download_youtube_ytdlp(link: str, task_dir: Path, with_cookies: bool = True, format_best: bool = False) -> tuple[list[Path] | None, str] | tuple[list[Path], str]:
+    """Download YouTube with yt-dlp. Returns (files, 'video') on success, or (None, error_text) on failure."""
     task_dir.mkdir(parents=True, exist_ok=True)
     since_ts = time.time()
     out_tpl = str(task_dir / "%(title).80s.%(id)s.%(ext)s")
-    # YouTube can be slow; use relaxed socket timeout and 3 retries
     yt_opts = ["--concurrent-fragments", "16", "--retries", "3", "--socket-timeout", "25"]
     if format_best:
         args = [
@@ -924,26 +934,29 @@ def download_youtube_ytdlp(link: str, task_dir: Path, with_cookies: bool = True,
         if cookie_file.is_file():
             args.insert(1, str(cookie_file))
             args.insert(1, "--cookies")
-    run_cmd(args, timeout=DOWNLOAD_TIMEOUT)
+    err, _ = run_cmd(args, timeout=DOWNLOAD_TIMEOUT)
     files = recent_files(since_ts, task_dir)
     files = [p for p in files if p.suffix.lower() in (".mp4", ".mov", ".webm", ".mkv") and p.stat().st_size >= MIN_VIDEO_BYTES]
     if files:
         return (files, "video")
-    return None
+    return (None, err or "")
 
 
 # ---------------------------------------------------------------------------
 # Facebook video: yt-dlp (only for Facebook video URLs)
 # ---------------------------------------------------------------------------
 def download_facebook_video_ytdlp(url: str, task_dir: Path) -> tuple[list[Path], str] | None:
-    """Download Facebook video with yt-dlp. Returns (files, 'video') or None."""
+    """Download Facebook video with yt-dlp. Prefer H.264 + re-encode so video plays (no blank screen). Returns (files, 'video') or None."""
     task_dir.mkdir(parents=True, exist_ok=True)
     since_ts = time.time()
     out_tpl = str(task_dir / "%(title).80s.%(id)s.%(ext)s")
+    # Prefer H.264 video so output plays everywhere; post-process to H.264+AAC to avoid VP9/codec blank screen
     args = [
         "yt-dlp", "--no-warnings", "--max-filesize", f"{MAX_VIDEO_MB}M",
         *_YTDLP_FAST,
-        "-f", "bv*[height<=1080]+ba/b", "--merge-output-format", "mp4",
+        "-f", "bv*[vcodec^=avc1][height<=1080]+ba/bv*[height<=1080]+ba",
+        "--merge-output-format", "mp4",
+        "--postprocessor-args", "ffmpeg:-c:v libx264 -profile:v baseline -level 3.0 -pix_fmt yuv420p -c:a aac -movflags +faststart",
         "-o", out_tpl, url,
     ]
     cookie_file = BASE_DIR / "facebook.txt"
@@ -1033,19 +1046,30 @@ def download_other(link: str, task_dir: Path) -> tuple[list[Path], str] | None:
     task_dir.mkdir(parents=True, exist_ok=True)
 
     if is_youtube(link):
-        # Only fetch cookies when file is missing — never overwrite existing (e.g. browser-exported) cookies
         cookie_file = BASE_DIR / "youtube.txt"
         if not cookie_file.is_file():
             get_youtube_cookies_headless(cookie_file)
-        result = download_youtube_ytdlp(link, task_dir, with_cookies=True, format_best=False)
+
+        def try_ytdlp() -> tuple[tuple[list[Path], str] | None, str]:
+            """Returns (result_or_None, last_error_text)."""
+            last_err = ""
+            for with_cookies, fmt in [(True, False), (True, True), (False, True)]:
+                out = download_youtube_ytdlp(link, task_dir, with_cookies=with_cookies, format_best=fmt)
+                files, msg = out[0], out[1]
+                last_err = msg or last_err
+                if files:
+                    return ((files, "video"), "")
+            return (None, last_err)
+
+        result, last_err = try_ytdlp()
         if result:
             return result
-        result = download_youtube_ytdlp(link, task_dir, with_cookies=True, format_best=True)
-        if result:
-            return result
-        result = download_youtube_ytdlp(link, task_dir, with_cookies=False, format_best=True)
-        if result:
-            return result
+        # Auth/cookie error? Refresh cookies automatically so you don't have to export every time
+        if cookie_file.is_file() and _is_youtube_auth_error(last_err):
+            get_youtube_cookies_headless(cookie_file)
+            result, _ = try_ytdlp()
+            if result:
+                return result
         pytube_files = download_youtube_pytube(link, task_dir)
         if pytube_files:
             return pytube_files, detect_type(pytube_files)
@@ -1172,13 +1196,9 @@ async def send_media(
 # Handlers
 # ---------------------------------------------------------------------------
 COOKIES_HELP = (
-    "🍪 **YouTube cookies — bir marta eksport, uzoq ishlatish**\n\n"
-    "Bot **mavjud youtube.txt ni hech qachon ustiga yozmaydi**. Agar siz brauzerdan eksport qilib **youtube.txt** ni qo‘ysangiz, bot faqat shundan foydalanadi va yangilamaydi.\n\n"
-    "1. **Incognito/private** oyna oching, YouTube’da login qiling.\n"
-    "2. **Xuddi shu** tabda: https://www.youtube.com/robots.txt oching.\n"
-    "3. **youtube.com** cookie’larini **Netscape** formatida eksport qiling (Get cookies.txt LOCALLY / Cookie-Editor).\n"
-    "4. Faylni **youtube.txt** deb saqlab, bot papkasiga qo‘ying. Incognito oynani **yoping**.\n\n"
-    "Shundan keyin yangilash shart emas — cookie’lar ishlaguncha bot ularni ishlatadi. Muddat tugasa, qayta eksport qiling."
+    "🍪 **YouTube cookies**\n\n"
+    "**Eksport qilish shart emas** — bot cookie’lar ishlamasa (masalan, \"Sign in\" xatosi) avtomatik yangilaydi. Hech narsa qilmasangiz ham bot yangi cookie’larni olishga harakat qiladi.\n\n"
+    "Agar brauzerdan **youtube.txt** eksport qilsangiz, uzoqroq ishlashi mumkin. Bot faqat xato auth/cookie bo‘lsa avtomatik yangilaydi; oddiy eksport qilingan faylni o‘zi ustiga yozmaydi, faqat \"cookie ishlamayapti\" bo‘lsa yangilaydi."
 )
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
