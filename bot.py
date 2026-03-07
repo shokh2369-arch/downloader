@@ -1033,27 +1033,19 @@ def download_other(link: str, task_dir: Path) -> tuple[list[Path], str] | None:
     task_dir.mkdir(parents=True, exist_ok=True)
 
     if is_youtube(link):
-        # 1) yt-dlp first (most reliable); get cookies if missing
+        # Only fetch cookies when file is missing — never overwrite existing (e.g. browser-exported) cookies
         cookie_file = BASE_DIR / "youtube.txt"
         if not cookie_file.is_file():
             get_youtube_cookies_headless(cookie_file)
         result = download_youtube_ytdlp(link, task_dir, with_cookies=True, format_best=False)
         if result:
             return result
-        # 2) yt-dlp with -f b (best single file, works when format string fails)
         result = download_youtube_ytdlp(link, task_dir, with_cookies=True, format_best=True)
         if result:
             return result
-        # 3) Refresh cookies and retry
-        get_youtube_cookies_headless(cookie_file)
-        result = download_youtube_ytdlp(link, task_dir, with_cookies=True, format_best=True)
-        if result:
-            return result
-        # 4) yt-dlp without cookies
         result = download_youtube_ytdlp(link, task_dir, with_cookies=False, format_best=True)
         if result:
             return result
-        # 5) Pytube as last resort (720p progressive)
         pytube_files = download_youtube_pytube(link, task_dir)
         if pytube_files:
             return pytube_files, detect_type(pytube_files)
@@ -1180,13 +1172,13 @@ async def send_media(
 # Handlers
 # ---------------------------------------------------------------------------
 COOKIES_HELP = (
-    "🍪 **YouTube cookies — uzoq ishlashi uchun**\n\n"
-    "YouTube brauzerda aktiv bo‘lganda cookie’larni almashtiradi. Quyidagi usul ularni uzoqroq saqlaydi:\n\n"
+    "🍪 **YouTube cookies — bir marta eksport, uzoq ishlatish**\n\n"
+    "Bot **mavjud youtube.txt ni hech qachon ustiga yozmaydi**. Agar siz brauzerdan eksport qilib **youtube.txt** ni qo‘ysangiz, bot faqat shundan foydalanadi va yangilamaydi.\n\n"
     "1. **Incognito/private** oyna oching, YouTube’da login qiling.\n"
-    "2. **Xuddi shu** tabda: https://www.youtube.com/robots.txt (incognitoda faqat shu tab ochiq bo‘lsin).\n"
-    "3. **youtube.com** cookie’larini **Netscape** formatida eksport qiling (Get cookies.txt / Cookie-Editor).\n"
-    "4. Faylni **youtube.txt** deb saqlab, bot papkasiga qo‘ying; keyin incognito oynani **yoping**.\n\n"
-    "Session yopilgach cookie’lar aylanmaydi, shuning uchun uzoqroq ishlaydi. Qayta kerak bo‘lsa, xuddi shu usulni takrorlang."
+    "2. **Xuddi shu** tabda: https://www.youtube.com/robots.txt oching.\n"
+    "3. **youtube.com** cookie’larini **Netscape** formatida eksport qiling (Get cookies.txt LOCALLY / Cookie-Editor).\n"
+    "4. Faylni **youtube.txt** deb saqlab, bot papkasiga qo‘ying. Incognito oynani **yoping**.\n\n"
+    "Shundan keyin yangilash shart emas — cookie’lar ishlaguncha bot ularni ishlatadi. Muddat tugasa, qayta eksport qiling."
 )
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
