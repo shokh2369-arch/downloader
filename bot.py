@@ -26,7 +26,9 @@ from typing import Any
 from urllib.parse import urlparse
 
 # Parallel download workers (I/O-bound)
-_DOWNLOAD_WORKERS = 6
+_DOWNLOAD_WORKERS = 8
+# yt-dlp speed: more fragments in parallel, fewer retries, shorter socket timeout
+_YTDLP_FAST = ["--concurrent-fragments", "16", "--retries", "2", "--socket-timeout", "15"]
 
 from dotenv import load_dotenv
 from telegram import Message, Update
@@ -177,7 +179,7 @@ def run_cmd(
 def recent_files(
     since_ts: float,
     directory: Path,
-    buffer_sec: float = 1.0,
+    buffer_sec: float = 0.5,
 ) -> list[Path]:
     """Return sorted list of files in directory modified after since_ts - buffer_sec."""
     files: list[Path] = []
@@ -307,7 +309,7 @@ def get_youtube_cookies_headless(cookie_path: Path, timeout_sec: int = 25) -> bo
             )
             page = context.new_page()
             page.goto("https://www.youtube.com", wait_until="domcontentloaded", timeout=timeout_sec * 1000)
-            page.wait_for_timeout(1200)
+            page.wait_for_timeout(800)
             cookies = context.cookies()
             browser.close()
         if not cookies:
@@ -362,7 +364,7 @@ def get_facebook_cookies_headless(cookie_path: Path, timeout_sec: int = 25) -> b
             )
             page = context.new_page()
             page.goto("https://www.facebook.com", wait_until="domcontentloaded", timeout=timeout_sec * 1000)
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(700)
             cookies = context.cookies()
             browser.close()
         if not cookies:
@@ -377,7 +379,7 @@ def get_facebook_cookies_headless(cookie_path: Path, timeout_sec: int = 25) -> b
 
 
 def _get_site_cookies_headless(
-    url: str, cookie_path: Path, timeout_sec: int = 20, wait_ms: int = 1200, comment: str = "Cookies"
+    url: str, cookie_path: Path, timeout_sec: int = 18, wait_ms: int = 900, comment: str = "Cookies"
 ) -> bool:
     """Generic: open URL in headless browser, save cookies to cookie_path (Netscape). Returns True if written."""
     try:
@@ -409,20 +411,20 @@ def _get_site_cookies_headless(
 
 def get_twitter_cookies_headless(cookie_path: Path, timeout_sec: int = 20) -> bool:
     """Auto-get Twitter/X cookies via headless browser. Saves to cookie_path (Netscape)."""
-    return _get_site_cookies_headless("https://twitter.com", cookie_path, timeout_sec=timeout_sec, wait_ms=1500, comment="Twitter")
+    return _get_site_cookies_headless("https://twitter.com", cookie_path, timeout_sec=timeout_sec, wait_ms=1000, comment="Twitter")
 
 
 def get_pinterest_cookies_headless(cookie_path: Path, timeout_sec: int = 20) -> bool:
     """Auto-get Pinterest cookies via headless browser. Saves to cookie_path (Netscape)."""
-    return _get_site_cookies_headless("https://www.pinterest.com", cookie_path, timeout_sec=timeout_sec, wait_ms=1500, comment="Pinterest")
+    return _get_site_cookies_headless("https://www.pinterest.com", cookie_path, timeout_sec=timeout_sec, wait_ms=1000, comment="Pinterest")
 
 
 def get_instagram_cookies_headless(cookie_path: Path, timeout_sec: int = 22) -> bool:
     """Auto-get Instagram cookies via headless browser. Saves to cookie_path (Netscape)."""
-    return _get_site_cookies_headless("https://www.instagram.com", cookie_path, timeout_sec=timeout_sec, wait_ms=1800, comment="Instagram")
+    return _get_site_cookies_headless("https://www.instagram.com", cookie_path, timeout_sec=timeout_sec, wait_ms=1100, comment="Instagram")
 
 
-def resolve_facebook_share_url(url: str, timeout_sec: int = 14) -> str | None:
+def resolve_facebook_share_url(url: str, timeout_sec: int = 12) -> str | None:
     """
     Resolve Facebook share URL (e.g. facebook.com/share/v/...) to the real video/page URL.
     Uses redirect + og:url fallback. Returns final URL or None.
@@ -443,7 +445,7 @@ def resolve_facebook_share_url(url: str, timeout_sec: int = 14) -> str | None:
             )
             page = context.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_sec * 1000)
-            page.wait_for_timeout(1400)
+            page.wait_for_timeout(900)
             final = page.url
             # If still on share URL, try og:url then any watch/video link on the page
             if final and "/share/" in final.lower():
@@ -514,7 +516,7 @@ def _netscape_cookies_to_playwright(cookie_path: Path) -> list[dict]:
     return out
 
 
-def _download_url_to_file(url: str, dest: Path, timeout_sec: int = 45, referer: str | None = None) -> bool:
+def _download_url_to_file(url: str, dest: Path, timeout_sec: int = 28, referer: str | None = None) -> bool:
     """Download URL to dest; return True on success. Optional referer for Facebook CDN."""
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
@@ -537,7 +539,7 @@ def _download_url_to_file(url: str, dest: Path, timeout_sec: int = 45, referer: 
 
 def _download_urls_parallel(
     url_dest_pairs: list[tuple[str, Path]],
-    timeout_sec: int = 45,
+    timeout_sec: int = 26,
     max_workers: int = _DOWNLOAD_WORKERS,
 ) -> list[Path]:
     """Download multiple URLs to destinations in parallel; return list of Paths that succeeded."""
@@ -571,7 +573,7 @@ def download_facebook_media_scraper(url: str, task_dir: Path) -> tuple[list[Path
     try:
         # post_urls accepts full URLs; youtube_dl=True helps extract video URL (including carousel)
         opts = {"allow_extra_requests": True}
-        posts = list(get_posts("facebook", post_urls=[url], cookies=cookies, timeout=16, extra_info=False, options=opts, youtube_dl=True))
+        posts = list(get_posts("facebook", post_urls=[url], cookies=cookies, timeout=12, extra_info=False, options=opts, youtube_dl=True))
         if not posts:
             return None
         post = posts[0]
@@ -585,7 +587,7 @@ def download_facebook_media_scraper(url: str, task_dir: Path) -> tuple[list[Path
         downloaded: list[Path] = []
         if video_url and isinstance(video_url, str):
             dest = task_dir / "fb_video_0.mp4"
-            if _download_url_to_file(video_url, dest, timeout_sec=32) and dest.stat().st_size >= MIN_VIDEO_BYTES:
+            if _download_url_to_file(video_url, dest, timeout_sec=24) and dest.stat().st_size >= MIN_VIDEO_BYTES:
                 downloaded.append(dest)
         # If post had video but we got none, return None so Playwright can try
         if video_url and not any(p.suffix.lower() in (".mp4", ".mov") for p in downloaded):
@@ -599,7 +601,7 @@ def download_facebook_media_scraper(url: str, task_dir: Path) -> tuple[list[Path
             if ext.lower() not in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
                 ext = ".jpg"
             img_pairs.append((u, task_dir / f"fb_image_{i}{ext}"))
-        downloaded.extend(_download_urls_parallel(img_pairs, timeout_sec=28))
+        downloaded.extend(_download_urls_parallel(img_pairs, timeout_sec=22))
         if not downloaded:
             return None
         has_video = any(p.suffix.lower() in (".mp4", ".mov") for p in downloaded)
@@ -610,7 +612,7 @@ def download_facebook_media_scraper(url: str, task_dir: Path) -> tuple[list[Path
         return None
 
 
-def download_facebook_media_playwright(url: str, task_dir: Path, timeout_sec: int = 14) -> tuple[list[Path], str] | None:
+def download_facebook_media_playwright(url: str, task_dir: Path, timeout_sec: int = 11) -> tuple[list[Path], str] | None:
     """
     Fallback: use Playwright to open Facebook page, extract video/image URLs from DOM. Supports carousel (video + photos).
     Returns (files, "video"|"image") or None.
@@ -624,7 +626,7 @@ def download_facebook_media_playwright(url: str, task_dir: Path, timeout_sec: in
     task_dir.mkdir(parents=True, exist_ok=True)
     effective_url = url
     if "facebook.com/share" in url.lower():
-        resolved = resolve_facebook_share_url(url, timeout_sec=12)
+        resolved = resolve_facebook_share_url(url, timeout_sec=10)
         if resolved:
             effective_url = resolved
     try:
@@ -641,7 +643,7 @@ def download_facebook_media_playwright(url: str, task_dir: Path, timeout_sec: in
                     context.add_cookies(cookies)
             page = context.new_page()
             page.goto(effective_url, wait_until="domcontentloaded", timeout=timeout_sec * 1000)
-            page.wait_for_timeout(1200)
+            page.wait_for_timeout(800)
             media_urls = page.evaluate("""
                 () => {
                     const out = { videos: [], images: [] };
@@ -673,7 +675,7 @@ def download_facebook_media_playwright(url: str, task_dir: Path, timeout_sec: in
             if not u or not isinstance(u, str):
                 continue
             dest = task_dir / f"fb_video_{i}.mp4"
-            if _download_url_to_file(u, dest, timeout_sec=32) and dest.stat().st_size >= MIN_VIDEO_BYTES:
+            if _download_url_to_file(u, dest, timeout_sec=24) and dest.stat().st_size >= MIN_VIDEO_BYTES:
                 downloaded.append(dest)
                 break  # one video only (carousel: video + photos)
         img_pairs = []
@@ -685,7 +687,7 @@ def download_facebook_media_playwright(url: str, task_dir: Path, timeout_sec: in
             if ext.lower() not in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
                 ext = ".jpg"
             img_pairs.append((u, task_dir / f"fb_image_{i}{ext}"))
-        downloaded.extend(_download_urls_parallel(img_pairs, timeout_sec=28))
+        downloaded.extend(_download_urls_parallel(img_pairs, timeout_sec=22))
         if not downloaded:
             return None
         has_video = any(p.suffix.lower() in (".mp4", ".mov") for p in downloaded)
@@ -696,7 +698,7 @@ def download_facebook_media_playwright(url: str, task_dir: Path, timeout_sec: in
         return None
 
 
-def download_twitter_media_playwright(url: str, task_dir: Path, timeout_sec: int = 20) -> tuple[list[Path], str] | None:
+def download_twitter_media_playwright(url: str, task_dir: Path, timeout_sec: int = 16) -> tuple[list[Path], str] | None:
     """
     Use Playwright to open tweet page, extract image URLs from DOM (pbs.twimg.com), download.
     Returns (files, "image") or None. No yt-dlp; works for photo tweets when cookies are present.
@@ -722,7 +724,7 @@ def download_twitter_media_playwright(url: str, task_dir: Path, timeout_sec: int
                     context.add_cookies(cookies)
             page = context.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_sec * 1000)
-            page.wait_for_timeout(2600)
+            page.wait_for_timeout(1600)
             image_urls = page.evaluate("""
                 () => {
                     const seen = new Set();
@@ -753,7 +755,7 @@ def download_twitter_media_playwright(url: str, task_dir: Path, timeout_sec: int
             if ext.lower() not in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
                 ext = ".jpg"
             img_pairs.append((u, task_dir / f"tw_image_{i}{ext}"))
-        downloaded = _download_urls_parallel(img_pairs, timeout_sec=40)
+        downloaded = _download_urls_parallel(img_pairs, timeout_sec=26)
         if not downloaded:
             return None
         logger.info("Twitter (Playwright): downloaded %s image(s)", len(downloaded))
@@ -763,7 +765,7 @@ def download_twitter_media_playwright(url: str, task_dir: Path, timeout_sec: int
         return None
 
 
-def download_pinterest_media_playwright(url: str, task_dir: Path, timeout_sec: int = 18) -> tuple[list[Path], str] | None:
+def download_pinterest_media_playwright(url: str, task_dir: Path, timeout_sec: int = 14) -> tuple[list[Path], str] | None:
     """
     Use Playwright to open Pinterest pin page, extract image URLs (og:image, i.pinimg.com), download.
     Returns (files, "image") or None. Works for image pins when yt-dlp fails.
@@ -789,7 +791,7 @@ def download_pinterest_media_playwright(url: str, task_dir: Path, timeout_sec: i
                     context.add_cookies(cookies)
             page = context.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_sec * 1000)
-            page.wait_for_timeout(2500)
+            page.wait_for_timeout(1500)
             # Only use og:image = the actual pin image. Skip all other imgs (logos, icons, placeholders).
             image_urls = page.evaluate("""
                 () => {
@@ -813,7 +815,7 @@ def download_pinterest_media_playwright(url: str, task_dir: Path, timeout_sec: i
             if ext.lower() not in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
                 ext = ".jpg"
             img_pairs.append((u, task_dir / f"pin_image_{i}{ext}"))
-        downloaded = _download_urls_parallel(img_pairs, timeout_sec=40)
+        downloaded = _download_urls_parallel(img_pairs, timeout_sec=26)
         if not downloaded:
             return None
         logger.info("Pinterest (Playwright): downloaded %s image(s)", len(downloaded))
@@ -863,7 +865,7 @@ def download_instagram_instaloader(shortcode: str, download_dir: Path) -> list[P
             max_connection_attempts=3,
             sleep=False,  # no delay between requests — faster; single-post use keeps rate-limit risk low
             user_agent=INSTAGRAM_UA,  # Chrome UA + Referer below improve CDN speed (see instaloader #1233)
-            request_timeout=35.0,
+            request_timeout=25.0,
         )
         # Load cookies from instagram.txt (Netscape) if present (auto-fetched when missing)
         instagram_cookie = BASE_DIR / "instagram.txt"
@@ -896,17 +898,27 @@ def download_instagram_instaloader(shortcode: str, download_dir: Path) -> list[P
 _UA_CHROME = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 
-def download_youtube_ytdlp(link: str, task_dir: Path, with_cookies: bool = True) -> tuple[list[Path], str] | None:
-    """Download YouTube with yt-dlp. Uses youtube.txt if with_cookies and file exists. Returns (files, 'video') or None."""
+def download_youtube_ytdlp(link: str, task_dir: Path, with_cookies: bool = True, format_best: bool = False) -> tuple[list[Path], str] | None:
+    """Download YouTube with yt-dlp. Uses youtube.txt if with_cookies and file exists. format_best=True uses -f b. Returns (files, 'video') or None."""
     task_dir.mkdir(parents=True, exist_ok=True)
     since_ts = time.time()
     out_tpl = str(task_dir / "%(title).80s.%(id)s.%(ext)s")
-    args = [
-        "yt-dlp", "--no-warnings", "--max-filesize", f"{MAX_VIDEO_MB}M",
-        "--user-agent", _UA_CHROME,
-        "-f", "bv*[height<=1080]+ba/b", "--merge-output-format", "mp4",
-        "-o", out_tpl, link,
-    ]
+    # YouTube can be slow; use relaxed socket timeout and 3 retries
+    yt_opts = ["--concurrent-fragments", "16", "--retries", "3", "--socket-timeout", "25"]
+    if format_best:
+        args = [
+            "yt-dlp", "--no-warnings", "--max-filesize", f"{MAX_VIDEO_MB}M",
+            *yt_opts, "--user-agent", _UA_CHROME,
+            "-f", "b", "--merge-output-format", "mp4",
+            "-o", out_tpl, link,
+        ]
+    else:
+        args = [
+            "yt-dlp", "--no-warnings", "--max-filesize", f"{MAX_VIDEO_MB}M",
+            *yt_opts, "--user-agent", _UA_CHROME,
+            "-f", "bv*[height<=1080]+ba/b", "--merge-output-format", "mp4",
+            "-o", out_tpl, link,
+        ]
     if with_cookies:
         cookie_file = BASE_DIR / "youtube.txt"
         if cookie_file.is_file():
@@ -930,6 +942,7 @@ def download_facebook_video_ytdlp(url: str, task_dir: Path) -> tuple[list[Path],
     out_tpl = str(task_dir / "%(title).80s.%(id)s.%(ext)s")
     args = [
         "yt-dlp", "--no-warnings", "--max-filesize", f"{MAX_VIDEO_MB}M",
+        *_YTDLP_FAST,
         "-f", "bv*[height<=1080]+ba/b", "--merge-output-format", "mp4",
         "-o", out_tpl, url,
     ]
@@ -955,6 +968,7 @@ def download_tiktok_ytdlp(link: str, task_dir: Path) -> tuple[list[Path], str] |
     out_tpl = str(task_dir / "%(title).80s.%(id)s.%(ext)s")
     args = [
         "yt-dlp", "--no-warnings", "--max-filesize", f"{MAX_VIDEO_MB}M",
+        *_YTDLP_FAST,
         "--no-check-certificates",
         "-f", "bv*[height<=1080]+ba/b", "--merge-output-format", "mp4",
         "-o", out_tpl, link,
@@ -964,7 +978,7 @@ def download_tiktok_ytdlp(link: str, task_dir: Path) -> tuple[list[Path], str] |
     files = [p for p in files if p.suffix.lower() in (".mp4", ".mov", ".webm", ".mkv") and p.stat().st_size >= MIN_VIDEO_BYTES]
     if files:
         return (files, "video")
-    time.sleep(2)
+    time.sleep(1)
     run_cmd(args, timeout=DOWNLOAD_TIMEOUT)
     files = recent_files(since_ts, task_dir)
     files = [p for p in files if p.suffix.lower() in (".mp4", ".mov", ".webm", ".mkv") and p.stat().st_size >= MIN_VIDEO_BYTES]
@@ -1002,7 +1016,7 @@ def reencode_video_ios_compatible(src: Path) -> Path | None:
     _safe_unlink(out)
     # Fallback: remux only (copy streams + faststart) — works when source is already playable
     cmd_fast = ["ffmpeg", "-y", "-i", str(src), "-c", "copy", "-movflags", "+faststart", str(out)]
-    err2, code2 = run_cmd(cmd_fast, timeout=120)
+    err2, code2 = run_cmd(cmd_fast, timeout=90)
     if code2 == 0 and out.is_file() and out.stat().st_size >= MIN_VIDEO_BYTES:
         logger.info("Video sent with faststart remux (re-encode skipped)")
         return out
@@ -1019,25 +1033,30 @@ def download_other(link: str, task_dir: Path) -> tuple[list[Path], str] | None:
     task_dir.mkdir(parents=True, exist_ok=True)
 
     if is_youtube(link):
-        # 1) Pytube first (720p progressive, no cookies)
-        pytube_files = download_youtube_pytube(link, task_dir)
-        if pytube_files:
-            return pytube_files, detect_type(pytube_files)
-        # 2) yt-dlp fallback (with cookies if available)
+        # 1) yt-dlp first (most reliable); get cookies if missing
         cookie_file = BASE_DIR / "youtube.txt"
         if not cookie_file.is_file():
             get_youtube_cookies_headless(cookie_file)
-        result = download_youtube_ytdlp(link, task_dir, with_cookies=True)
+        result = download_youtube_ytdlp(link, task_dir, with_cookies=True, format_best=False)
         if result:
             return result
+        # 2) yt-dlp with -f b (best single file, works when format string fails)
+        result = download_youtube_ytdlp(link, task_dir, with_cookies=True, format_best=True)
+        if result:
+            return result
+        # 3) Refresh cookies and retry
         get_youtube_cookies_headless(cookie_file)
-        result = download_youtube_ytdlp(link, task_dir, with_cookies=True)
+        result = download_youtube_ytdlp(link, task_dir, with_cookies=True, format_best=True)
         if result:
             return result
-        # 3) yt-dlp without cookies (some public videos work)
-        result = download_youtube_ytdlp(link, task_dir, with_cookies=False)
+        # 4) yt-dlp without cookies
+        result = download_youtube_ytdlp(link, task_dir, with_cookies=False, format_best=True)
         if result:
             return result
+        # 5) Pytube as last resort (720p progressive)
+        pytube_files = download_youtube_pytube(link, task_dir)
+        if pytube_files:
+            return pytube_files, detect_type(pytube_files)
         return None
 
     # Facebook: video URL → yt-dlp; else scraper + Playwright in parallel
@@ -1080,7 +1099,7 @@ def download_other(link: str, task_dir: Path) -> tuple[list[Path], str] | None:
             # If first completed had no result, wait for the other (remaining time)
             pending = [x for x in (fut_s, fut_p) if x not in done]
             if pending:
-                done2, _ = wait(pending, timeout=12)
+                done2, _ = wait(pending, timeout=10)
                 for f in done2:
                     try:
                         result = f.result(timeout=0)
