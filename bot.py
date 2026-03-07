@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import http.cookiejar
+import json
 import logging
 import os
 import re
@@ -108,6 +109,41 @@ MAX_CAROUSEL_IMAGES = 20
 
 # Cookie files we write; invalid ones are auto-deleted at startup so deployment can re-fetch
 COOKIE_FILES = ("youtube.txt", "facebook.txt", "twitter.txt", "pinterest.txt", "instagram.txt")
+
+
+def load_proxies() -> list[str]:
+    """Load proxy URLs for YouTube (cookies + yt-dlp). Tries proxies.json (array of {ip,port,user,pass}) then proxies.txt (one http://user:pass@ip:port per line). Returns list of proxy URL strings."""
+    out: list[str] = []
+    # proxies.json: same shape as proxies.js — [{"ip":"...","port":"...","user":"...","pass":"..."}]
+    json_path = BASE_DIR / "proxies.json"
+    if json_path.is_file():
+        try:
+            data = json.loads(json_path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                for p in data:
+                    if isinstance(p, dict):
+                        ip = (p.get("ip") or "").strip()
+                        port = str(p.get("port") or "").strip()
+                        user = (p.get("user") or "").strip()
+                        pass_ = (p.get("pass") or p.get("password") or "").strip()
+                        if ip and port:
+                            if user and pass_:
+                                out.append(f"http://{user}:{pass_}@{ip}:{port}")
+                            else:
+                                out.append(f"http://{ip}:{port}")
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("load_proxies proxies.json: %s", e)
+    # proxies.txt: one URL per line (http://user:pass@ip:port or http://ip:port)
+    txt_path = BASE_DIR / "proxies.txt"
+    if not out and txt_path.is_file():
+        try:
+            for line in txt_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and ("http://" in line or "https://" in line):
+                    out.append(line)
+        except OSError as e:
+            logger.warning("load_proxies proxies.txt: %s", e)
+    return out
 
 
 def _cookie_file_has_invalid_expiry(path: Path) -> bool:
@@ -310,10 +346,11 @@ def _cookies_to_netscape(cookies: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def get_youtube_cookies_headless(cookie_path: Path, timeout_sec: int = 25) -> bool:
+def get_youtube_cookies_headless(cookie_path: Path, timeout_sec: int = 25, proxy_url: str | None = None) -> bool:
     """
     Use headless browser (Playwright) to open YouTube and capture cookies,
-    save in Netscape format to cookie_path. Returns True if cookies were written.
+    save in Netscape format to cookie_path. If proxy_url is set (http://user:pass@ip:port), use it.
+    Returns True if cookies were written.
     """
     try:
         from playwright.sync_api import sync_playwright
@@ -323,10 +360,21 @@ def get_youtube_cookies_headless(cookie_path: Path, timeout_sec: int = 25) -> bo
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 720},
-            )
+            ctx_opts: dict[str, Any] = {
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "viewport": {"width": 1280, "height": 720},
+            }
+            if proxy_url:
+                try:
+                    parsed = urlparse(proxy_url)
+                    server = f"{parsed.scheme or 'http'}://{parsed.hostname}:{parsed.port}" if parsed.port else f"{parsed.scheme or 'http'}://{parsed.hostname}"
+                    ctx_opts["proxy"] = {"server": server}
+                    if parsed.username is not None or parsed.password is not None:
+                        ctx_opts["proxy"]["username"] = parsed.username or ""
+                        ctx_opts["proxy"]["password"] = parsed.password or ""
+                except Exception:
+                    ctx_opts["proxy"] = {"server": proxy_url}
+            context = browser.new_context(**ctx_opts)
             page = context.new_page()
             page.goto("https://www.youtube.com", wait_until="domcontentloaded", timeout=timeout_sec * 1000)
             page.wait_for_timeout(800)
@@ -336,7 +384,7 @@ def get_youtube_cookies_headless(cookie_path: Path, timeout_sec: int = 25) -> bo
             return False
         netscape = _cookies_to_netscape(cookies)
         cookie_path.write_text(netscape, encoding="utf-8")
-        logger.info("YouTube cookies saved from headless browser to %s", cookie_path.name)
+        logger.info("YouTube cookies saved from headless browser to %s (proxy=%s)", cookie_path.name, "yes" if proxy_url else "no")
         return True
     except Exception as e:
         logger.warning("Headless YouTube cookies: %s", e)
@@ -962,8 +1010,8 @@ def _is_youtube_auth_error(err_text: str) -> bool:
     )
 
 
-def download_youtube_ytdlp(link: str, task_dir: Path, with_cookies: bool = True, format_best: bool = False) -> tuple[list[Path] | None, str] | tuple[list[Path], str]:
-    """Download YouTube with yt-dlp. Returns (files, 'video') on success, or (None, error_text) on failure."""
+def download_youtube_ytdlp(link: str, task_dir: Path, with_cookies: bool = True, format_best: bool = False, proxy_url: str | None = None) -> tuple[list[Path] | None, str] | tuple[list[Path], str]:
+    """Download YouTube with yt-dlp. If proxy_url is set, use --proxy. Returns (files, 'video') on success, or (None, error_text) on failure."""
     task_dir.mkdir(parents=True, exist_ok=True)
     since_ts = time.time()
     out_tpl = str(task_dir / "%(title).80s.%(id)s.%(ext)s")
@@ -982,6 +1030,9 @@ def download_youtube_ytdlp(link: str, task_dir: Path, with_cookies: bool = True,
             "-f", "bv*[height<=1080]+ba/b", "--merge-output-format", "mp4",
             "-o", out_tpl, link,
         ]
+    if proxy_url:
+        args.insert(1, proxy_url)
+        args.insert(1, "--proxy")
     if with_cookies:
         cookie_file = BASE_DIR / "youtube.txt"
         if cookie_file.is_file():
@@ -1100,26 +1151,36 @@ def download_other(link: str, task_dir: Path) -> tuple[list[Path], str] | None:
 
     if is_youtube(link):
         cookie_file = BASE_DIR / "youtube.txt"
+        proxies = load_proxies()
+        # Cookie fetch with proxy rotation: try no proxy, then each proxy until one succeeds
         if not cookie_file.is_file():
-            get_youtube_cookies_headless(cookie_file)
+            if not get_youtube_cookies_headless(cookie_file):
+                for proxy_url in proxies:
+                    if get_youtube_cookies_headless(cookie_file, proxy_url=proxy_url):
+                        break
 
         def try_ytdlp() -> tuple[tuple[list[Path], str] | None, str]:
-            """Returns (result_or_None, last_error_text)."""
+            """Try yt-dlp with proxy rotation: no proxy first, then each proxy until one succeeds. Returns (result_or_None, last_error_text)."""
             last_err = ""
-            for with_cookies, fmt in [(True, False), (True, True), (False, True)]:
-                out = download_youtube_ytdlp(link, task_dir, with_cookies=with_cookies, format_best=fmt)
-                files, msg = out[0], out[1]
-                last_err = msg or last_err
-                if files:
-                    return ((files, "video"), "")
+            candidates: list[str | None] = [None] + proxies
+            for proxy_url in candidates:
+                for with_cookies, fmt in [(True, False), (True, True), (False, True)]:
+                    out = download_youtube_ytdlp(link, task_dir, with_cookies=with_cookies, format_best=fmt, proxy_url=proxy_url)
+                    files, msg = out[0], out[1]
+                    last_err = msg or last_err
+                    if files:
+                        return ((files, "video"), "")
             return (None, last_err)
 
         result, last_err = try_ytdlp()
         if result:
             return result
-        # Auth/cookie error? Refresh cookies automatically so you don't have to export every time
+        # Auth/cookie error? Refresh cookies with proxy rotation, then retry yt-dlp
         if cookie_file.is_file() and _is_youtube_auth_error(last_err):
-            get_youtube_cookies_headless(cookie_file)
+            if not get_youtube_cookies_headless(cookie_file):
+                for proxy_url in proxies:
+                    if get_youtube_cookies_headless(cookie_file, proxy_url=proxy_url):
+                        break
             result, _ = try_ytdlp()
             if result:
                 return result
