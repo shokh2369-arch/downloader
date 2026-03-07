@@ -130,6 +130,26 @@ def cleanup_invalid_cookie_files() -> None:
             logger.info("Removed invalid cookie file %s (will be re-created when needed)", name)
 
 
+def _auto_collect_cookies_startup() -> None:
+    """Background: collect cookies for any platform that has no cookie file yet, so first use is faster."""
+    collectors = [
+        ("YouTube", BASE_DIR / "youtube.txt", get_youtube_cookies_headless),
+        ("Instagram", BASE_DIR / "instagram.txt", get_instagram_cookies_headless),
+        ("Facebook", BASE_DIR / "facebook.txt", get_facebook_cookies_headless),
+        ("Twitter", BASE_DIR / "twitter.txt", get_twitter_cookies_headless),
+        ("Pinterest", BASE_DIR / "pinterest.txt", get_pinterest_cookies_headless),
+    ]
+    for label, path, getter in collectors:
+        if path.is_file():
+            continue
+        try:
+            if getter(path):
+                logger.info("Auto-collected cookies: %s", label)
+        except Exception as e:
+            logger.warning("Auto-collect %s cookies: %s", label, e)
+        time.sleep(2)
+
+
 def _safe_rmtree(path: Path) -> None:
     """Remove directory tree; never raise."""
     try:
@@ -835,6 +855,39 @@ def get_instaloader_media(target_dir: Path) -> list[Path]:
     return sorted(p for p in target_dir.rglob("*") if p.is_file() and p.suffix.lower() in exts)
 
 
+# ---------------------------------------------------------------------------
+# Instagram: yt-dlp (video/reels) — try before Instaloader
+# ---------------------------------------------------------------------------
+def download_instagram_ytdlp(link: str, task_dir: Path) -> tuple[list[Path], str] | None:
+    """Download Instagram post/reel with yt-dlp. Returns (files, 'video'|'image') or None."""
+    if "instagram.com" not in link.lower():
+        return None
+    task_dir.mkdir(parents=True, exist_ok=True)
+    since_ts = time.time()
+    out_tpl = str(task_dir / "%(title).80s.%(id)s.%(ext)s")
+    args = [
+        "yt-dlp", "--no-warnings", "--max-filesize", f"{MAX_VIDEO_MB}M",
+        *_YTDLP_FAST,
+        "-f", "bv*[height<=1080]+ba/b", "--merge-output-format", "mp4",
+        "-o", out_tpl, link,
+    ]
+    cookie_file = BASE_DIR / "instagram.txt"
+    if cookie_file.is_file():
+        args.insert(1, str(cookie_file))
+        args.insert(1, "--cookies")
+    run_cmd(args, timeout=DOWNLOAD_TIMEOUT)
+    files = recent_files(since_ts, task_dir)
+    video_files = [p for p in files if p.suffix.lower() in (".mp4", ".mov", ".webm", ".mkv") and p.stat().st_size >= MIN_VIDEO_BYTES]
+    image_files = [p for p in files if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".gif")]
+    if video_files:
+        return (video_files, "video")
+    if image_files:
+        return (image_files, "image")
+    if files:
+        return (files, "video" if any(p.suffix.lower() in (".mp4", ".mov") for p in files) else "image")
+    return None
+
+
 # Chrome UA + Referer improve Instagram CDN speed (default UA without referer can be ~50KB/s).
 INSTAGRAM_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -1075,57 +1128,63 @@ def download_other(link: str, task_dir: Path) -> tuple[list[Path], str] | None:
             return pytube_files, detect_type(pytube_files)
         return None
 
-    # Facebook: video URL → yt-dlp; else scraper + Playwright in parallel
+    # Facebook: video URL → yt-dlp; else scraper + Playwright in parallel (auto-refresh cookies on failure)
     is_facebook = "facebook.com" in link.lower() or "fb.watch" in link.lower() or "fb.com" in link.lower()
     if is_facebook:
         facebook_cookie_path = BASE_DIR / "facebook.txt"
         if not facebook_cookie_path.is_file():
             get_facebook_cookies_headless(facebook_cookie_path)
-        effective = link
-        if "facebook.com/share" in link.lower():
-            resolved = resolve_facebook_share_url(link)
-            if resolved:
-                effective = resolved
-        if is_facebook_video_url(effective):
-            result = download_facebook_video_ytdlp(effective, task_dir)
-            if result:
-                return result
-        def only_photos_if_carousel(files: list[Path], typ: str) -> tuple[list[Path], str]:
-            img_exts = (".jpg", ".jpeg", ".png", ".webp", ".gif")
-            has_vid = any(p.suffix.lower() in (".mp4", ".mov") for p in files)
-            has_img = any(p.suffix.lower() in img_exts for p in files)
-            if has_vid and has_img:
-                return ([p for p in files if p.suffix.lower() in img_exts], "image")
-            return (files, typ)
-        # Parallel run: two subdirs so outputs don't clash
-        dir_s, dir_p = task_dir / "s", task_dir / "p"
-        dir_s.mkdir(parents=True, exist_ok=True)
-        dir_p.mkdir(parents=True, exist_ok=True)
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            fut_s = ex.submit(download_facebook_media_scraper, effective, dir_s)
-            fut_p = ex.submit(download_facebook_media_playwright, effective, dir_p)
-            done, _ = wait([fut_s, fut_p], timeout=22, return_when=FIRST_COMPLETED)
-            for f in done:
-                try:
-                    result = f.result(timeout=0)
-                except Exception:
-                    continue
+
+        def _facebook_fetch() -> tuple[list[Path], str] | None:
+            effective = link
+            if "facebook.com/share" in link.lower():
+                resolved = resolve_facebook_share_url(link)
+                if resolved:
+                    effective = resolved
+            if is_facebook_video_url(effective):
+                result = download_facebook_video_ytdlp(effective, task_dir)
                 if result:
-                    return only_photos_if_carousel(*result)
-            # If first completed had no result, wait for the other (remaining time)
-            pending = [x for x in (fut_s, fut_p) if x not in done]
-            if pending:
-                done2, _ = wait(pending, timeout=10)
-                for f in done2:
+                    return result
+            def only_photos_if_carousel(files: list[Path], typ: str) -> tuple[list[Path], str]:
+                img_exts = (".jpg", ".jpeg", ".png", ".webp", ".gif")
+                has_vid = any(p.suffix.lower() in (".mp4", ".mov") for p in files)
+                has_img = any(p.suffix.lower() in img_exts for p in files)
+                if has_vid and has_img:
+                    return ([p for p in files if p.suffix.lower() in img_exts], "image")
+                return (files, typ)
+            dir_s, dir_p = task_dir / "s", task_dir / "p"
+            dir_s.mkdir(parents=True, exist_ok=True)
+            dir_p.mkdir(parents=True, exist_ok=True)
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                fut_s = ex.submit(download_facebook_media_scraper, effective, dir_s)
+                fut_p = ex.submit(download_facebook_media_playwright, effective, dir_p)
+                done, _ = wait([fut_s, fut_p], timeout=22, return_when=FIRST_COMPLETED)
+                for f in done:
                     try:
                         result = f.result(timeout=0)
                     except Exception:
                         continue
                     if result:
                         return only_photos_if_carousel(*result)
-        return None
+                pending = [x for x in (fut_s, fut_p) if x not in done]
+                if pending:
+                    done2, _ = wait(pending, timeout=10)
+                    for f in done2:
+                        try:
+                            result = f.result(timeout=0)
+                        except Exception:
+                            continue
+                        if result:
+                            return only_photos_if_carousel(*result)
+            return None
 
-    # Twitter/X: Playwright for images only (auto-get cookies if missing)
+        result = _facebook_fetch()
+        if result:
+            return result
+        get_facebook_cookies_headless(facebook_cookie_path)
+        return _facebook_fetch()
+
+    # Twitter/X: Playwright for images (auto-collect and refresh cookies on failure)
     if "twitter.com" in link.lower() or "x.com" in link.lower():
         twitter_cookie = BASE_DIR / "twitter.txt"
         if not twitter_cookie.is_file():
@@ -1133,9 +1192,11 @@ def download_other(link: str, task_dir: Path) -> tuple[list[Path], str] | None:
         result = download_twitter_media_playwright(link, task_dir)
         if result:
             return result
-        return None
+        get_twitter_cookies_headless(twitter_cookie)
+        result = download_twitter_media_playwright(link, task_dir)
+        return result if result else None
 
-    # Pinterest: Playwright for images only (auto-get cookies if missing)
+    # Pinterest: Playwright for images (auto-collect and refresh cookies on failure)
     if "pinterest.com" in link.lower() or "pin.it" in link.lower():
         pinterest_cookie = BASE_DIR / "pinterest.txt"
         if not pinterest_cookie.is_file():
@@ -1143,7 +1204,9 @@ def download_other(link: str, task_dir: Path) -> tuple[list[Path], str] | None:
         result = download_pinterest_media_playwright(link, task_dir)
         if result:
             return result
-        return None
+        get_pinterest_cookies_headless(pinterest_cookie)
+        result = download_pinterest_media_playwright(link, task_dir)
+        return result if result else None
 
     # TikTok: yt-dlp
     if "tiktok.com" in link.lower() or "vm.tiktok" in link.lower():
@@ -1204,10 +1267,10 @@ COOKIES_HELP = (
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 Salom!\n\n"
-        "• **YouTube** — pytube.\n"
-        "• **Instagram** — public post/reel.\n"
+        "• **YouTube** — yt-dlp + pytube.\n"
+        "• **Instagram** — yt-dlp / Instaloader (public post/reel).\n"
         "• **Facebook, X, Pinterest** — scraper / Playwright (images; Facebook also video when available).\n\n"
-        "Cookie’larni uzoq ishlatish: /cookies",
+        "Cookie’lar avtomatik yig'iladi; qo'lda eksport shart emas. Batafsil: /cookies",
         parse_mode="Markdown",
     )
 
@@ -1245,12 +1308,35 @@ async def _process_links_task(
         for link in links:
             shortcode = instagram_shortcode(link)
             if shortcode:
-                # Auto-get Instagram cookies if missing
+                # Auto-get Instagram cookies if missing (for yt-dlp and Instaloader)
                 instagram_cookie = BASE_DIR / "instagram.txt"
                 if not instagram_cookie.is_file():
                     await asyncio.to_thread(get_instagram_cookies_headless, instagram_cookie)
                 ig_dir = DOWNLOADS_DIR / "ig" / f"task_{update.update_id}_{id(link)}"
                 ig_dir.mkdir(parents=True, exist_ok=True)
+                # Try yt-dlp first for Instagram video/reels (auto-refresh cookies on failure)
+                ig_ytdlp_dir = ig_dir / "ytdlp"
+                result = await asyncio.to_thread(download_instagram_ytdlp, link, ig_ytdlp_dir)
+                if result is None:
+                    await asyncio.to_thread(get_instagram_cookies_headless, instagram_cookie)
+                    result = await asyncio.to_thread(download_instagram_ytdlp, link, ig_ytdlp_dir)
+                if result is not None:
+                    files, media_type = result
+                    await try_delete_status()
+                    video_paths = [p for p in files if p.suffix.lower() in (".mp4", ".mov", ".webm", ".mkv")]
+                    reencoded_list = await asyncio.gather(
+                        *[asyncio.to_thread(reencode_video_ios_compatible, p) for p in video_paths]
+                    ) if video_paths else []
+                    vid_idx = 0
+                    for fp in files:
+                        is_video = fp.suffix.lower() in (".mp4", ".mov", ".webm", ".mkv")
+                        to_send = (reencoded_list[vid_idx] or fp) if is_video else fp
+                        if is_video:
+                            vid_idx += 1
+                        await send_media(update, context, to_send, "video" if is_video else "image", reply_to_id)
+                    cleanup_ig_dir(ig_dir)
+                    continue
+                files = None
                 try:
                     files = await asyncio.to_thread(download_instagram_instaloader, shortcode, ig_dir)
                 except PrivateProfileNotFollowedException:
@@ -1258,19 +1344,31 @@ async def _process_links_task(
                     cleanup_ig_dir(ig_dir)
                     continue
                 except LoginRequiredException:
-                    await status_msg.edit_text("❌ Instagram login soʻrayapti. Keyinroq urinib koʻring.")
-                    cleanup_ig_dir(ig_dir)
-                    continue
+                    await asyncio.to_thread(get_instagram_cookies_headless, instagram_cookie)
+                    try:
+                        files = await asyncio.to_thread(download_instagram_instaloader, shortcode, ig_dir)
+                    except Exception:
+                        await status_msg.edit_text("❌ Instagram login soʻrayapti. Keyinroq urinib koʻring.")
+                        cleanup_ig_dir(ig_dir)
+                        continue
                 except ConnectionException:
                     await status_msg.edit_text("❌ Instagramga ulanib boʻlmadi. Ulovni tekshiring.")
                     cleanup_ig_dir(ig_dir)
                     continue
                 except InstaloaderException as e:
                     err_text = str(e)
-                    msg = "❌ Instagram blok qildi. Keyinroq yoki boshqa link." if ("403" in err_text or "Forbidden" in err_text) else f"❌ Yuklab boʻlmadi: {err_text[:150]}"
-                    await status_msg.edit_text(msg)
-                    cleanup_ig_dir(ig_dir)
-                    continue
+                    if "403" in err_text or "Forbidden" in err_text:
+                        await asyncio.to_thread(get_instagram_cookies_headless, instagram_cookie)
+                        try:
+                            files = await asyncio.to_thread(download_instagram_instaloader, shortcode, ig_dir)
+                        except Exception:
+                            await status_msg.edit_text("❌ Instagram blok qildi. Keyinroq yoki boshqa link.")
+                            cleanup_ig_dir(ig_dir)
+                            continue
+                    else:
+                        await status_msg.edit_text(f"❌ Yuklab boʻlmadi: {err_text[:150]}")
+                        cleanup_ig_dir(ig_dir)
+                        continue
                 except Exception as e:
                     logger.exception("Instagram download user_id=%s link=%s", user_id, link[:50])
                     await status_msg.edit_text(f"❌ Xatolik: {str(e)[:100]}")
@@ -1419,6 +1517,9 @@ def main() -> None:
     health_thread = threading.Thread(target=_run_health_server, args=(health_port,), daemon=True)
     health_thread.start()
     logger.info("Health server listening on 0.0.0.0:%s", health_port)
+
+    # Auto-collect cookies for any platform missing a cookie file (non-blocking)
+    threading.Thread(target=_auto_collect_cookies_startup, daemon=True).start()
 
     app = (
         Application.builder()
