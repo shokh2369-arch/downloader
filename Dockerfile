@@ -1,4 +1,4 @@
-# Telegram media downloader bot: YouTube (youtube-dl), Instagram, Facebook, TikTok, X, Pinterest (yt-dlp)
+# Telegram media downloader bot: YouTube (pytube), Instagram, Facebook, X, Pinterest. No yt-dlp.
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
